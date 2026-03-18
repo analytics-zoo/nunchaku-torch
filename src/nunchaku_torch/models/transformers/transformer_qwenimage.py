@@ -1,0 +1,458 @@
+import gc
+import json
+import os
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple, Union
+from warnings import warn
+
+import numpy as np
+import torch
+from diffusers.models.attention_processor import Attention
+from diffusers.models.modeling_outputs import Transformer2DModelOutput
+from diffusers.models.transformers.transformer_qwenimage import (
+    QwenEmbedRope,
+    QwenImageTransformer2DModel,
+    QwenImageTransformerBlock,
+)
+from diffusers.utils import logging as diffusers_logging
+from huggingface_hub import utils
+
+from ...utils import get_precision
+
+try:
+    from ..._C import ops as _C_ops
+except ImportError:
+    _C_ops = None
+from ..attention import NunchakuBaseAttention, NunchakuFeedForward
+from ..attention_processors.qwenimage import NunchakuQwenImageNaiveFA2Processor
+from ..linear import AWQW4A16Linear, SVDQW4A4Linear
+from ..utils import CPUOffloadManager, fuse_linears
+from .utils import (
+    NunchakuModelLoaderMixin,
+    convert_fp16,
+    decode_int4_state_dict_for_cpu,
+    patch_scale_key,
+)
+
+logger = diffusers_logging.get_logger(__name__)
+
+
+class NunchakuQwenAttention(NunchakuBaseAttention):
+    def __init__(self, other: Attention, processor: str = "flashattn2", **kwargs):
+        super().__init__(processor)
+        self.inner_dim = other.inner_dim
+        self.inner_kv_dim = other.inner_kv_dim
+        self.query_dim = other.query_dim
+        self.use_bias = other.use_bias
+        self.is_cross_attention = other.is_cross_attention
+        self.cross_attention_dim = other.cross_attention_dim
+        self.upcast_attention = other.upcast_attention
+        self.upcast_softmax = other.upcast_softmax
+        self.rescale_output_factor = other.rescale_output_factor
+        self.residual_connection = other.residual_connection
+        self.dropout = other.dropout
+        self.fused_projections = other.fused_projections
+        self.out_dim = other.out_dim
+        self.out_context_dim = other.out_context_dim
+        self.context_pre_only = other.context_pre_only
+        self.pre_only = other.pre_only
+        self.is_causal = other.is_causal
+        self.scale_qk = other.scale_qk
+        self.scale = other.scale
+        self.heads = other.heads
+        self.sliceable_head_dim = other.sliceable_head_dim
+        self.added_kv_proj_dim = other.added_kv_proj_dim
+        self.only_cross_attention = other.only_cross_attention
+        self.group_norm = other.group_norm
+        self.spatial_norm = other.spatial_norm
+        self.norm_cross = other.norm_cross
+        self.norm_q = other.norm_q
+        self.norm_k = other.norm_k
+        self.norm_added_q = other.norm_added_q
+        self.norm_added_k = other.norm_added_k
+
+        with torch.device("meta"):
+            to_qkv = fuse_linears([other.to_q, other.to_k, other.to_v])
+        self.to_qkv = SVDQW4A4Linear.from_linear(to_qkv, **kwargs)
+        self.to_out = other.to_out
+        self.to_out[0] = SVDQW4A4Linear.from_linear(self.to_out[0], **kwargs)
+
+        assert self.added_kv_proj_dim is not None
+        with torch.device("meta"):
+            add_qkv_proj = fuse_linears(
+                [other.add_q_proj, other.add_k_proj, other.add_v_proj]
+            )
+        self.add_qkv_proj = SVDQW4A4Linear.from_linear(add_qkv_proj, **kwargs)
+        self.to_add_out = SVDQW4A4Linear.from_linear(other.to_add_out, **kwargs)
+
+    def forward(
+        self,
+        hidden_states: torch.FloatTensor,
+        encoder_hidden_states: torch.FloatTensor = None,
+        encoder_hidden_states_mask: torch.FloatTensor = None,
+        attention_mask: Optional[torch.FloatTensor] = None,
+        image_rotary_emb: Optional[torch.Tensor] = None,
+        **kwargs,
+    ):
+        return self.processor(
+            self,
+            hidden_states,
+            encoder_hidden_states,
+            encoder_hidden_states_mask,
+            attention_mask,
+            image_rotary_emb,
+            **kwargs,
+        )
+
+    def set_processor(self, processor: str):
+        if processor == "flashattn2":
+            self.processor = NunchakuQwenImageNaiveFA2Processor()
+        else:
+            raise ValueError(f"Processor {processor} is not supported")
+
+
+class NunchakuQwenImageTransformerBlock(QwenImageTransformerBlock):
+    def __init__(
+        self, other: QwenImageTransformerBlock, scale_shift: float = 1.0, **kwargs
+    ):
+        super(QwenImageTransformerBlock, self).__init__()
+
+        self.dim = other.dim
+        self.img_mod = other.img_mod
+        self.img_mod[1] = AWQW4A16Linear.from_linear(other.img_mod[1], **kwargs)
+        self.img_norm1 = other.img_norm1
+        self.attn = NunchakuQwenAttention(other.attn, **kwargs)
+        self.img_norm2 = other.img_norm2
+        self.img_mlp = NunchakuFeedForward(other.img_mlp, **kwargs)
+
+        self.txt_mod = other.txt_mod
+        self.txt_mod[1] = AWQW4A16Linear.from_linear(other.txt_mod[1], **kwargs)
+        self.txt_norm1 = other.txt_norm1
+        self.txt_norm2 = other.txt_norm2
+        self.txt_mlp = NunchakuFeedForward(other.txt_mlp, **kwargs)
+
+        self.scale_shift = scale_shift
+
+    def _modulate(
+        self, x: torch.Tensor, mod_params: torch.Tensor
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        shift, scale, gate = mod_params.chunk(3, dim=-1)
+        if self.scale_shift != 0:
+            scale.add_(self.scale_shift)
+        return x * scale.unsqueeze(1) + shift.unsqueeze(1), gate.unsqueeze(1)
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor,
+        encoder_hidden_states_mask: torch.Tensor,
+        temb: torch.Tensor,
+        image_rotary_emb: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
+        joint_attention_kwargs: Optional[Dict[str, Any]] = None,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        img_mod_params = self.img_mod(temb)
+        txt_mod_params = self.txt_mod(temb)
+
+        img_mod_params = (
+            img_mod_params.view(img_mod_params.shape[0], -1, 6)
+            .transpose(1, 2)
+            .reshape(img_mod_params.shape[0], -1)
+        )
+        txt_mod_params = (
+            txt_mod_params.view(txt_mod_params.shape[0], -1, 6)
+            .transpose(1, 2)
+            .reshape(txt_mod_params.shape[0], -1)
+        )
+
+        img_mod1, img_mod2 = img_mod_params.chunk(2, dim=-1)
+        txt_mod1, txt_mod2 = txt_mod_params.chunk(2, dim=-1)
+
+        img_normed = self.img_norm1(hidden_states)
+        img_modulated, img_gate1 = self._modulate(img_normed, img_mod1)
+
+        txt_normed = self.txt_norm1(encoder_hidden_states)
+        txt_modulated, txt_gate1 = self._modulate(txt_normed, txt_mod1)
+
+        joint_attention_kwargs = joint_attention_kwargs or {}
+        img_attn_output, txt_attn_output = self.attn(
+            hidden_states=img_modulated,
+            encoder_hidden_states=txt_modulated,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            image_rotary_emb=image_rotary_emb,
+            **joint_attention_kwargs,
+        )
+
+        hidden_states = hidden_states + img_gate1 * img_attn_output
+        encoder_hidden_states = encoder_hidden_states + txt_gate1 * txt_attn_output
+
+        img_normed2 = self.img_norm2(hidden_states)
+        img_modulated2, img_gate2 = self._modulate(img_normed2, img_mod2)
+        img_mlp_output = self.img_mlp(img_modulated2)
+        hidden_states = hidden_states + img_gate2 * img_mlp_output
+
+        txt_normed2 = self.txt_norm2(encoder_hidden_states)
+        txt_modulated2, txt_gate2 = self._modulate(txt_normed2, txt_mod2)
+        txt_mlp_output = self.txt_mlp(txt_modulated2)
+        encoder_hidden_states = encoder_hidden_states + txt_gate2 * txt_mlp_output
+
+        if encoder_hidden_states.dtype == torch.float16:
+            encoder_hidden_states = encoder_hidden_states.clip(-65504, 65504)
+        if hidden_states.dtype == torch.float16:
+            hidden_states = hidden_states.clip(-65504, 65504)
+
+        return encoder_hidden_states, hidden_states
+
+
+class NunchakuQwenImageTransformer2DModel(
+    QwenImageTransformer2DModel, NunchakuModelLoaderMixin
+):
+    def __init__(self, *args, **kwargs):
+        self.offload = kwargs.pop("offload", False)
+        self.offload_manager = None
+        self._is_initialized = False
+        super().__init__(*args, **kwargs)
+
+    def _patch_model(self, **kwargs):
+        for i, block in enumerate(self.transformer_blocks):
+            self.transformer_blocks[i] = NunchakuQwenImageTransformerBlock(
+                block, scale_shift=0, **kwargs
+            )
+        self._is_initialized = True
+        return self
+
+    @classmethod
+    @utils.validate_hf_hub_args
+    def from_pretrained(
+        cls, pretrained_model_name_or_path: str | os.PathLike[str], **kwargs
+    ):
+        device = kwargs.get("device", "cpu")
+        offload = kwargs.get("offload", False)
+        torch_dtype = kwargs.get("torch_dtype", torch.bfloat16)
+
+        if isinstance(pretrained_model_name_or_path, str):
+            pretrained_model_name_or_path = Path(pretrained_model_name_or_path)
+
+        assert (
+            pretrained_model_name_or_path.is_file()
+            or pretrained_model_name_or_path.name.endswith((".safetensors", ".sft"))
+        ), "Only safetensors are supported"
+        transformer, model_state_dict, metadata = cls._build_model(
+            pretrained_model_name_or_path, **kwargs
+        )
+        quantization_config = json.loads(metadata.get("quantization_config", "{}"))
+        config = json.loads(metadata.get("config", "{}"))
+        rank = quantization_config.get("rank", 32)
+        transformer = transformer.to(torch_dtype)
+
+        precision = get_precision(
+            kwargs.get("precision", "auto"), device, pretrained_model_name_or_path
+        )
+        if precision == "fp4":
+            precision = "nvfp4"
+
+        transformer._patch_model(precision=precision, rank=rank)
+        transformer = transformer.to_empty(device=device)
+        transformer.pos_embed = QwenEmbedRope(
+            theta=10000,
+            axes_dim=list(config.get("axes_dims_rope", [16, 56, 56])),
+            scale_rope=True,
+        )
+
+        device_type = (
+            torch.device(device).type
+            if not isinstance(device, torch.device)
+            else device.type
+        )
+        if (device_type != "cuda" or _C_ops is None) and precision == "int4":
+            # CPU / XPU / any device without _C_ops:
+            # decode weights from CUDA tile layout to row-major for cpu_ops
+            decode_int4_state_dict_for_cpu(model_state_dict)
+
+        patch_scale_key(transformer, model_state_dict)
+        if torch_dtype == torch.float16:
+            convert_fp16(transformer, model_state_dict)
+
+        transformer.load_state_dict(model_state_dict)
+        transformer.set_offload(offload)
+        return transformer
+
+    def set_offload(self, offload: bool, **kwargs):
+        if offload == self.offload:
+            return
+        self.offload = offload
+        if offload:
+            self.offload_manager = CPUOffloadManager(
+                self.transformer_blocks,
+                use_pin_memory=kwargs.get("use_pin_memory", True),
+                on_gpu_modules=[
+                    self.img_in,
+                    self.txt_in,
+                    self.txt_norm,
+                    self.time_text_embed,
+                    self.norm_out,
+                    self.proj_out,
+                ],
+                num_blocks_on_gpu=kwargs.get("num_blocks_on_gpu", 1),
+            )
+        else:
+            self.offload_manager = None
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+    def forward(
+        self,
+        hidden_states: torch.Tensor,
+        encoder_hidden_states: torch.Tensor = None,
+        encoder_hidden_states_mask: torch.Tensor = None,
+        timestep: torch.LongTensor = None,
+        img_shapes: Optional[List[Tuple[int, int, int]]] = None,
+        txt_seq_lens: Optional[List[int]] = None,
+        guidance: torch.Tensor = None,
+        attention_kwargs: Optional[Dict[str, Any]] = None,
+        controlnet_block_samples=None,
+        return_dict: bool = True,
+    ) -> Union[torch.Tensor, Transformer2DModelOutput]:
+        device = hidden_states.device
+        use_cuda_streams = device.type == "cuda"
+        if self.offload:
+            self.offload_manager.set_device(device)
+
+        hidden_states = self.img_in(hidden_states)
+        timestep = timestep.to(hidden_states.dtype)
+        encoder_hidden_states = self.txt_norm(encoder_hidden_states)
+        encoder_hidden_states = self.txt_in(encoder_hidden_states)
+
+        if guidance is not None:
+            guidance = guidance.to(hidden_states.dtype) * 1000
+
+        temb = (
+            self.time_text_embed(timestep, hidden_states)
+            if guidance is None
+            else self.time_text_embed(timestep, guidance, hidden_states)
+        )
+
+        image_rotary_emb = self.pos_embed(
+            img_shapes, txt_seq_lens, device=hidden_states.device
+        )
+
+        if use_cuda_streams:
+            compute_stream = torch.cuda.current_stream()
+            if self.offload:
+                self.offload_manager.initialize(compute_stream)
+
+        for block_idx, block in enumerate(self.transformer_blocks):
+            if use_cuda_streams:
+                with torch.cuda.stream(compute_stream):
+                    if self.offload:
+                        block = self.offload_manager.get_block(block_idx)
+                    encoder_hidden_states, hidden_states = self._run_block(
+                        block,
+                        hidden_states,
+                        encoder_hidden_states,
+                        encoder_hidden_states_mask,
+                        temb,
+                        image_rotary_emb,
+                        attention_kwargs,
+                    )
+                    if controlnet_block_samples is not None:
+                        interval_control = int(
+                            np.ceil(
+                                len(self.transformer_blocks)
+                                / len(controlnet_block_samples)
+                            )
+                        )
+                        hidden_states = (
+                            hidden_states
+                            + controlnet_block_samples[block_idx // interval_control]
+                        )
+                if self.offload:
+                    self.offload_manager.step(compute_stream)
+            else:
+                encoder_hidden_states, hidden_states = self._run_block(
+                    block,
+                    hidden_states,
+                    encoder_hidden_states,
+                    encoder_hidden_states_mask,
+                    temb,
+                    image_rotary_emb,
+                    attention_kwargs,
+                )
+                if controlnet_block_samples is not None:
+                    interval_control = int(
+                        np.ceil(
+                            len(self.transformer_blocks) / len(controlnet_block_samples)
+                        )
+                    )
+                    hidden_states = (
+                        hidden_states
+                        + controlnet_block_samples[block_idx // interval_control]
+                    )
+
+        hidden_states = self.norm_out(hidden_states, temb)
+        output = self.proj_out(hidden_states)
+
+        if self.offload and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        if not return_dict:
+            return (output,)
+        return Transformer2DModelOutput(sample=output)
+
+    def _run_block(
+        self,
+        block,
+        hidden_states,
+        encoder_hidden_states,
+        encoder_hidden_states_mask,
+        temb,
+        image_rotary_emb,
+        attention_kwargs,
+    ):
+        if torch.is_grad_enabled() and self.gradient_checkpointing:
+            return self._gradient_checkpointing_func(
+                block,
+                hidden_states,
+                encoder_hidden_states,
+                encoder_hidden_states_mask,
+                temb,
+                image_rotary_emb,
+            )
+        return block(
+            hidden_states=hidden_states,
+            encoder_hidden_states=encoder_hidden_states,
+            encoder_hidden_states_mask=encoder_hidden_states_mask,
+            temb=temb,
+            image_rotary_emb=image_rotary_emb,
+            joint_attention_kwargs=attention_kwargs,
+        )
+
+    def to(self, *args, **kwargs):
+        device_arg_or_kwarg_present = (
+            any(isinstance(arg, torch.device) for arg in args) or "device" in kwargs
+        )
+        dtype_present_in_args = "dtype" in kwargs
+
+        for arg in args:
+            if not isinstance(arg, str):
+                continue
+            try:
+                torch.device(arg)
+                device_arg_or_kwarg_present = True
+            except RuntimeError:
+                pass
+
+        if not dtype_present_in_args:
+            for arg in args:
+                if isinstance(arg, torch.dtype):
+                    dtype_present_in_args = True
+                    break
+
+        if dtype_present_in_args and self._is_initialized:
+            raise ValueError(
+                "Casting a quantized model to a new `dtype` is unsupported. To set the dtype of unquantized layers, please use the `torch_dtype` argument when loading the model using `from_pretrained` or `from_single_file`."
+            )
+        if self.offload and device_arg_or_kwarg_present:
+            warn("Skipping moving the model to GPU as offload is enabled", UserWarning)
+            return self
+        return super(type(self), self).to(*args, **kwargs)

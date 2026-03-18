@@ -1,0 +1,36 @@
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "nunchaku-torch"
+version = "0.1.0"
+description = "Standalone PyTorch runtime for Nunchaku SVDQuant W4A4 inference on CPU, XPU, and CUDA"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "diffusers>=0.36",
+  "huggingface-hub>=0.34",
+  "packaging",
+  "pillow",
+  "safetensors",
+  "torch",
+  "transformers>=4.54",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.scripts]
+nunchaku-torch = "nunchaku_torch.zimage_cli:main"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
