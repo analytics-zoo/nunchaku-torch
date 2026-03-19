@@ -551,7 +551,7 @@ def awq_unpack_weights(kernel: torch.Tensor, n: int, k: int) -> torch.Tensor:
 
     u_idx = torch.arange(4, device=qw.device)
     n_idx = torch.arange(8, device=qw.device)
-    ic_offsets = (n_idx % 4) * 8 + 2 * u_idx.unsqueeze(-1) + (n_idx // 4)
+    ic_offsets = 2 * u_idx.unsqueeze(-1) + (n_idx // 2) * 8 + (n_idx % 2)
 
     weight = torch.zeros(
         n, num_groups_32, 32, dtype=torch.float32, device=kernel.device

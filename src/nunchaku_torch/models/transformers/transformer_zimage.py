@@ -233,10 +233,7 @@ class NunchakuZImageFusedModule(nn.Module):
                     query = self._apply_rotary_emb(query, freqs_cis)
                     key = self._apply_rotary_emb(key, freqs_cis)
 
-            output = torch.cat(
-                [query.flatten(2, 3), key.flatten(2, 3), value.flatten(2, 3)], dim=-1
-            )
-            return output
+            return query, key, value
 
         # --- Original CUDA path (unchanged) ---
         x = x.view(batch_size * seq_len, channels)
@@ -275,7 +272,13 @@ class NunchakuZImageFusedModule(nn.Module):
             rotary_emb=freqs_cis,
         )
         output = output.view(batch_size, seq_len, -1)
-        return output
+        head_dim = int(norm_q_weight.numel())
+        heads = output.shape[-1] // (3 * head_dim)
+        query, key, value = output.chunk(3, dim=-1)
+        query = query.view(batch_size, seq_len, heads, head_dim)
+        key = key.view(batch_size, seq_len, heads, head_dim)
+        value = value.view(batch_size, seq_len, heads, head_dim)
+        return query, key, value
 
 
 class NunchakuZImageAttention(NunchakuBaseAttention):

@@ -26,11 +26,17 @@ try:
         _fused_convert_add_available = True
     except AttributeError:
         _fused_convert_add_available = False
+    try:
+        _svdq.onednn_int4_gemm_add_to_output
+        _append_sum_available = True
+    except AttributeError:
+        _append_sum_available = False
 except ImportError:
     _svdq = None
     _xpu_available = False
     _onednn_available = False
     _fused_convert_add_available = False
+    _append_sum_available = False
 
 
 def is_available() -> bool:
@@ -234,37 +240,8 @@ def svdq_gemm_w4a4_xpu_bf16act(
         wscales_f16: [G, N] pre-converted f16 weight scales
         lora_act_in, lora_up, bias, etc: standard post-processing params
     """
-    # --- GEMM: oneDNN fused path (f16) or fallback (ESIMD dequant + matmul) ---
+    # --- Compute LoRA residual in bf16 (needed before GEMM for append_sum path) ---
     input_dtype = act_bf16.dtype
-    if _onednn_available and wgt_u4 is not None and wscales_f16 is not None:
-        if input_dtype == torch.float16:
-            act_f16 = act_bf16  # already f16 — no conversion needed
-        else:
-            act_f16 = act_bf16.to(torch.float16)
-        result = _svdq.onednn_int4_gemm_preconverted(act_f16, wgt_u4, wscales_f16)
-        # Keep result in f16 — do post-processing in f16 to avoid conversion overhead.
-        # Convert to output dtype only at the end (via out.copy_).
-        compute_dtype = torch.float16
-    else:
-        wgt_deq = _svdq.dequantize_w4(wgt.view(torch.uint8), wscales, input_dtype)
-        result = act_bf16 @ wgt_deq.T
-        compute_dtype = input_dtype
-
-    # --- Post-processing ---
-    # GEMM result is in compute_dtype (f16 for oneDNN, input_dtype for fallback).
-    # Alpha/wcscales are safe in f16 (small values), but LoRA residuals can exceed
-    # f16 max (65504) so LoRA must be computed in bf16.
-    #
-    # Performance: Using in-place ops (copy_ + add_) is ~4.7x faster than creating
-    # temporary tensors (.to(bf16) → new tensor + add → new tensor + copy_).
-    # We write the GEMM result directly to `out` via copy_ (which handles f16→bf16),
-    # then add LoRA residual and bias in-place.
-    if alpha is not None and alpha != 1.0:
-        result = result * alpha
-    if wcscales is not None:
-        result = result * wcscales.to(compute_dtype).view(1, -1)
-
-    # Compute LoRA residual in bf16 (before writing to out)
     residual = None
     if lora_act_in is not None:
         lora_act = lora_act_in  # already in input_dtype (bf16)
@@ -293,6 +270,61 @@ def svdq_gemm_w4a4_xpu_bf16act(
                 residual = residual + bias_effective.view(1, -1)
         else:
             raise ValueError(f"Unsupported lora_mode: {lora_mode}")
+
+    # --- Check if we can use the append_sum fast path ---
+    # append_sum: pre-fill out with residual, then GEMM adds result directly.
+    # Eliminates separate fused_convert_add kernel. Saves ~0.17s per image.
+    # Requirements: oneDNN path, residual exists, no SiLU, no alpha/wcscales scaling.
+    _use_append_sum = (
+        _append_sum_available
+        and _onednn_available
+        and wgt_u4 is not None
+        and wscales_f16 is not None
+        and residual is not None
+        and out is not None
+        and not fuse_silu
+        and (alpha is None or alpha == 1.0)
+        and wcscales is None
+    )
+
+    if _use_append_sum:
+        # --- append_sum fast path: out = residual + GEMM(act, wgt) in one primitive ---
+        if input_dtype == torch.float16:
+            act_f16 = act_bf16
+        else:
+            act_f16 = act_bf16.to(torch.float16)
+        out.copy_(residual)
+        _svdq.onednn_int4_gemm_add_to_output(act_f16, wgt_u4, wscales_f16, out)
+        return
+
+    # --- GEMM: oneDNN fused path (f16) or fallback (ESIMD dequant + matmul) ---
+    if _onednn_available and wgt_u4 is not None and wscales_f16 is not None:
+        if input_dtype == torch.float16:
+            act_f16 = act_bf16  # already f16 — no conversion needed
+        else:
+            act_f16 = act_bf16.to(torch.float16)
+        result = _svdq.onednn_int4_gemm_preconverted(act_f16, wgt_u4, wscales_f16)
+        # Keep result in f16 — do post-processing in f16 to avoid conversion overhead.
+        # Convert to output dtype only at the end (via out.copy_).
+        compute_dtype = torch.float16
+    else:
+        wgt_deq = _svdq.dequantize_w4(wgt.view(torch.uint8), wscales, input_dtype)
+        result = act_bf16 @ wgt_deq.T
+        compute_dtype = input_dtype
+
+    # --- Post-processing ---
+    # GEMM result is in compute_dtype (f16 for oneDNN, input_dtype for fallback).
+    # Alpha/wcscales are safe in f16 (small values), but LoRA residuals can exceed
+    # f16 max (65504) so LoRA must be computed in bf16.
+    #
+    # Performance: Using in-place ops (copy_ + add_) is ~4.7x faster than creating
+    # temporary tensors (.to(bf16) → new tensor + add → new tensor + copy_).
+    # We write the GEMM result directly to `out` via copy_ (which handles f16→bf16),
+    # then add LoRA residual and bias in-place.
+    if alpha is not None and alpha != 1.0:
+        result = result * alpha
+    if wcscales is not None:
+        result = result * wcscales.to(compute_dtype).view(1, -1)
 
     # --- Write output using in-place ops (4.7x faster than separate .to + add + copy) ---
     if out is not None:

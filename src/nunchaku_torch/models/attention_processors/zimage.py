@@ -17,12 +17,7 @@ class NunchakuZSingleStreamAttnProcessor(ZSingleStreamAttnProcessor):
         attention_mask: Optional[torch.Tensor] = None,
         freqs_cis: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        qkv = attn.fused_module(hidden_states, freqs_cis)
-
-        query, key, value = qkv.chunk(3, dim=-1)
-        query = query.unflatten(-1, (attn.heads, -1))
-        key = key.unflatten(-1, (attn.heads, -1))
-        value = value.unflatten(-1, (attn.heads, -1))
+        query, key, value = attn.fused_module(hidden_states, freqs_cis)
 
         dtype = query.dtype
         query, key = query.to(dtype), key.to(dtype)
